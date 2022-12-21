@@ -589,7 +589,8 @@ class CrossAttention(nn.Module):
 
         self._slice_size = slice_size
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None,
+                focused_attention_mask=None, focused_attention_norm=None):
         batch_size, sequence_length, _ = hidden_states.shape
 
         encoder_hidden_states = encoder_hidden_states
@@ -629,7 +630,11 @@ class CrossAttention(nn.Module):
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
         # attention, what we cannot get enough of
-        if self._use_memory_efficient_attention_xformers:
+        if focused_attention_mask is None:
+            raise Exception("not using focused attention")
+        if focused_attention_mask is not None:
+            hidden_states = self._focused_attention(query, key, value, focused_attention_mask, focused_attention_norm, attention_mask)
+        elif self._use_memory_efficient_attention_xformers:
             hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
             # Some versions of xformers return output in fp32, cast it back to the dtype of the input
             hidden_states = hidden_states.to(query.dtype)
@@ -666,6 +671,45 @@ class CrossAttention(nn.Module):
             attention_scores = attention_scores.float()
 
         attention_probs = attention_scores.softmax(dim=-1)
+
+        # cast back to the original dtype
+        attention_probs = attention_probs.to(value.dtype)
+
+        # compute attention output
+        hidden_states = torch.bmm(attention_probs, value)
+
+        # reshape hidden_states
+        hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
+        return hidden_states
+
+    def _focused_attention(self, query, key, value, focused_attention_mask, focused_attention_norm, attention_mask=None):
+        if self.upcast_attention:
+            query = query.float()
+            key = key.float()
+
+        attention_scores = torch.baddbmm(
+            torch.empty(query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device),
+            query,
+            key.transpose(-1, -2),
+            beta=0,
+            alpha=self.scale,
+        )
+
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+
+        if self.upcast_softmax:
+            attention_scores = attention_scores.float()
+
+        focus_weights = torch.bmm(attention_scores, focused_attention_mask)
+        if focused_attention_norm is not None:
+            focus_weights = focused_attention_norm(focus_weights)
+        # use min-max normalization
+        else:
+            focus_weights -= focus_weights.min(1, keepdim=True)[0]
+            focus_weights /= focus_weights.max(1, keepdim=True)[0]
+
+        attention_probs = (focus_weights * attention_scores).softmax(dim=-1)
 
         # cast back to the original dtype
         attention_probs = attention_probs.to(value.dtype)
