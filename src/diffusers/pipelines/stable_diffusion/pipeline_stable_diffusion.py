@@ -35,6 +35,7 @@ from ...schedulers import (
 from ...utils import deprecate, logging
 from . import StableDiffusionPipelineOutput
 from .safety_checker import StableDiffusionSafetyChecker
+import re
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -221,7 +222,8 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
 
-    def _encode_prompt(self, prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt):
+    def _encode_prompt(self, prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
+                       focused_attention_dependencies=None):
         r"""
         Encodes the prompt into text encoder hidden states.
 
@@ -272,6 +274,46 @@ class StableDiffusionPipeline(DiffusionPipeline):
         bs_embed, seq_len, _ = text_embeddings.shape
         text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)
         text_embeddings = text_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+        focused_attention_mask, w_mask = None, None
+        if focused_attention_dependencies is not None:
+            f_dep_idx = []
+
+            if isinstance(focused_attention_dependencies[0], tuple):
+                focused_attention_dependencies = [focused_attention_dependencies]
+
+            if batch_size != len(focused_attention_dependencies):
+                raise ValueError(
+                    f"`negative_prompt`: {focused_attention_dependencies} has batch size {len(focused_attention_dependencies)}, but `prompt`:"
+                    f" {prompt} has batch size {batch_size}. Please make sure that passed `focused_attention_dependencies` matches"
+                    " the batch size of `prompt`."
+                )
+
+            focused_attention_mask = torch.zeros(
+                (batch_size, self.tokenizer.model_max_length, self.tokenizer.model_max_length)).to(device)
+            w_mask = torch.zeros((batch_size, self.tokenizer.model_max_length)).to(device)
+
+            for batch_idx, f_deps in enumerate(focused_attention_dependencies):
+                sent = [re.sub("\<.*?\>", "", w) for w in self.tokenizer.convert_ids_to_tokens(text_input_ids[batch_idx], skip_special_tokens=False) if w != "!"]
+                for f_dep in f_deps:
+                    # x is dependant on y:
+                    f_dep_idx = [[i for i, e in enumerate(sent) if e == f_dep[0]], [i for i, e in enumerate(sent) if e == f_dep[1]]]
+
+                    for i in range(2):
+                        dep, dep_idx = f_dep[i], f_dep_idx[i]
+                        if len(dep_idx) == 0:
+                            raise ValueError(f"No match found for dependency '{dep}' of {f_dep} in tokenized sentence {sent}.")
+                        if len(dep_idx) > 1:
+                            raise ValueError(f"Multiple matches found for dependency '{dep}' of {f_dep} in tokenized sentence {sent}.")
+                        f_dep_idx[i] = dep_idx[0]
+
+                    focused_attention_mask[batch_idx, f_dep_idx[0], f_dep_idx[1]] = 1
+                    w_mask[batch_idx, f_dep_idx[0]] = 1
+
+            focused_attention_mask = focused_attention_mask.type(text_embeddings.dtype)
+            focused_attention_mask = torch.transpose(focused_attention_mask, -1, -2)
+            focused_attention_mask = focused_attention_mask.repeat(1, num_images_per_prompt, 1)
+            focused_attention_mask = focused_attention_mask.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
@@ -324,7 +366,17 @@ class StableDiffusionPipeline(DiffusionPipeline):
             # to avoid doing two forward passes
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
-        return text_embeddings
+            if focused_attention_dependencies is not None:
+                uncond_focused_attention_mask = torch.zeros_like(focused_attention_mask)
+                uncond_w_mask = torch.zeros_like(w_mask)
+                focused_attention_mask = torch.cat([uncond_focused_attention_mask, focused_attention_mask])
+                w_mask = torch.cat([uncond_w_mask, w_mask])
+                focused_attention_mask = focused_attention_mask, w_mask
+
+        if focused_attention_dependencies is not None:
+            return text_embeddings, focused_attention_mask
+        else:
+            return text_embeddings
 
     def run_safety_checker(self, image, device, dtype):
         if self.safety_checker is not None:
@@ -422,6 +474,8 @@ class StableDiffusionPipeline(DiffusionPipeline):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        use_focused_attention=False,
+        focused_attention_dependencies=None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -493,9 +547,18 @@ class StableDiffusionPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
-        text_embeddings = self._encode_prompt(
-            prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
-        )
+        focused_attention_mask = None
+        focused_attention_norm = None
+        if use_focused_attention:
+            text_embeddings, focused_attention_mask = self._encode_prompt(
+                prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
+                focused_attention_dependencies=focused_attention_dependencies
+            )
+        else:
+            text_embeddings = self._encode_prompt(
+                prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
+            )
+
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -526,7 +589,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings, focused_attention_mask=focused_attention_mask, focused_attention_norm=focused_attention_norm).sample
 
                 # perform guidance
                 if do_classifier_free_guidance:

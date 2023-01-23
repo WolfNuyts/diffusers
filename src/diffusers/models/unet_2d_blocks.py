@@ -481,11 +481,13 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None):
+    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None,
+                focused_attention_mask=None, focused_attention_norm=None):
         # TODO(Patrick, William) - attention_mask is currently not used. Implement once used
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
-            hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+            hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states,
+                focused_attention_mask=focused_attention_mask, focused_attention_norm=focused_attention_norm).sample
             hidden_states = resnet(hidden_states, temb)
 
         return hidden_states
@@ -775,7 +777,8 @@ class CrossAttnDownBlock2D(nn.Module):
                 )[0]
             else:
                 hidden_states = resnet(hidden_states, temb)
-                hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+                hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states,
+                    focused_attention_mask=focused_attention_mask, focused_attention_norm=focused_attention_norm).sample
 
             output_states += (hidden_states,)
 
@@ -1534,6 +1537,8 @@ class CrossAttnUpBlock2D(nn.Module):
         encoder_hidden_states=None,
         upsample_size=None,
         attention_mask=None,
+        focused_attention_mask=None,
+        focused_attention_norm=None,
     ):
         # TODO(Patrick, William) - attention mask is not used
         for resnet, attn in zip(self.resnets, self.attentions):
@@ -1561,7 +1566,8 @@ class CrossAttnUpBlock2D(nn.Module):
                 )[0]
             else:
                 hidden_states = resnet(hidden_states, temb)
-                hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+                hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states,
+                focused_attention_mask=focused_attention_mask, focused_attention_norm=focused_attention_norm).sample
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:

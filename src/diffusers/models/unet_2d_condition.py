@@ -428,6 +428,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
                     temb=emb,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
+                    focused_attention_mask=focused_attention_mask,
+                    focused_attention_norm=focused_attention_norm,
                 )
             else:
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
@@ -436,7 +438,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
 
         # 4. mid
         sample = self.mid_block(
-            sample, emb, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask
+            sample, emb, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask,
+                focused_attention_mask=focused_attention_mask, focused_attention_norm=focused_attention_norm
         )
 
         # 5. up
@@ -459,6 +462,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     upsample_size=upsample_size,
                     attention_mask=attention_mask,
+                    focused_attention_mask = focused_attention_mask,
+                    focused_attention_norm = focused_attention_norm,
                 )
             else:
                 sample = upsample_block(

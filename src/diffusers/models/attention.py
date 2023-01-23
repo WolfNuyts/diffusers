@@ -175,7 +175,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             self.norm_out = nn.LayerNorm(inner_dim)
             self.out = nn.Linear(inner_dim, self.num_vector_embeds - 1)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, return_dict: bool = True):
+    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, return_dict: bool = True,
+                focused_attention_mask=None, focused_attention_norm=None):
         """
         Args:
             hidden_states ( When discrete, `torch.LongTensor` of shape `(batch size, num latent pixels)`.
@@ -213,7 +214,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
         # 2. Blocks
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states=encoder_hidden_states, timestep=timestep)
+            hidden_states = block(hidden_states, encoder_hidden_states=encoder_hidden_states, timestep=timestep,
+                focused_attention_mask=focused_attention_mask, focused_attention_norm=focused_attention_norm)
 
         # 3. Output
         if self.is_input_continuous:
@@ -476,7 +478,8 @@ class BasicTransformerBlock(nn.Module):
             if self.attn2 is not None:
                 self.attn2._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, attention_mask=None):
+    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, attention_mask=None,
+                focused_attention_mask=None, focused_attention_norm=None):
         # 1. Self-Attention
         norm_hidden_states = (
             self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
@@ -484,7 +487,10 @@ class BasicTransformerBlock(nn.Module):
 
         if self.only_cross_attention:
             hidden_states = (
-                self.attn1(norm_hidden_states, encoder_hidden_states, attention_mask=attention_mask) + hidden_states
+                self.attn1(norm_hidden_states, encoder_hidden_states, attention_mask=attention_mask,
+                focused_attention_mask=focused_attention_mask, focused_attention_norm=focused_attention_norm
+                           )
+                + hidden_states
             )
         else:
             hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask) + hidden_states
@@ -496,7 +502,8 @@ class BasicTransformerBlock(nn.Module):
             )
             hidden_states = (
                 self.attn2(
-                    norm_hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask
+                    norm_hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask,
+                focused_attention_mask=focused_attention_mask, focused_attention_norm=focused_attention_norm
                 )
                 + hidden_states
             )
@@ -594,7 +601,16 @@ class CrossAttention(nn.Module):
         batch_size, sequence_length, _ = hidden_states.shape
 
         encoder_hidden_states = encoder_hidden_states
-
+        '''
+        if encoder_hidden_states is not None:
+            attention_mask = torch.zeros((batch_size, hidden_states.size(1), encoder_hidden_states.size(1))).to(encoder_hidden_states.device)
+            attention_mask[:, :, 0] = 1
+            attention_mask *= -5000
+        '''
+        '''
+        if (encoder_hidden_states is not None) and (focused_attention_mask is None):
+            raise Exception("not using focused attention")
+        '''
         if self.group_norm is not None:
             hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
@@ -630,8 +646,6 @@ class CrossAttention(nn.Module):
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
         # attention, what we cannot get enough of
-        if focused_attention_mask is None:
-            raise Exception("not using focused attention")
         if focused_attention_mask is not None:
             hidden_states = self._focused_attention(query, key, value, focused_attention_mask, focused_attention_norm, attention_mask)
         elif self._use_memory_efficient_attention_xformers:
@@ -683,6 +697,8 @@ class CrossAttention(nn.Module):
         return hidden_states
 
     def _focused_attention(self, query, key, value, focused_attention_mask, focused_attention_norm, attention_mask=None):
+        focused_attention_mask, w_mask = focused_attention_mask
+        focused_attention_mask, w_mask = torch.repeat_interleave(focused_attention_mask, self.heads, dim=0), torch.repeat_interleave(w_mask, self.heads, dim=0)
         if self.upcast_attention:
             query = query.float()
             key = key.float()
@@ -694,7 +710,6 @@ class CrossAttention(nn.Module):
             beta=0,
             alpha=self.scale,
         )
-
         if attention_mask is not None:
             attention_scores = attention_scores + attention_mask
 
@@ -702,12 +717,25 @@ class CrossAttention(nn.Module):
             attention_scores = attention_scores.float()
 
         focus_weights = torch.bmm(attention_scores, focused_attention_mask)
+        '''for i in range(len(attention_scores)):
+            focus_weights_row_as, focus_weights_row_mask = attention_scores[i].cpu().numpy(), focused_attention_mask[i].cpu().numpy()
+            focus_weights_row = torch.mm(attention_scores[i], focused_attention_mask[i])
+            focus_weights_row = focus_weights_row.cpu().numpy()
+            if i > 16:
+                print('')'''
         if focused_attention_norm is not None:
             focus_weights = focused_attention_norm(focus_weights)
         # use min-max normalization
         else:
-            focus_weights -= focus_weights.min(1, keepdim=True)[0]
-            focus_weights /= focus_weights.max(1, keepdim=True)[0]
+            focus_weights /= attention_scores[:, :, 1:].max(dim=-1, keepdim=True).values
+
+        #only active on the activated words -> need for better way of handling
+        focus_weights = torch.maximum(focus_weights, torch.logical_not(w_mask)[:, None, :])
+        focus_weights = focus_weights.reshape(-1, self.heads, *focus_weights.shape[1:])
+        focus_weights = focus_weights.max(dim=1)[0]
+        focus_weights = torch.repeat_interleave(focus_weights, self.heads, dim=0)
+        focus_weights = torch.where(focus_weights > 0.98, torch.ones_like(focus_weights),
+                                    torch.zeros_like(focus_weights))
 
         attention_probs = (focus_weights * attention_scores).softmax(dim=-1)
 
