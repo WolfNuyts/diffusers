@@ -223,7 +223,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         return self.device
 
     def _encode_prompt(self, prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
-                       focused_attention_dependencies=None):
+                       focused_attention_dependencies=None, text_replacements=None, global_constituents=None):
         r"""
         Encodes the prompt into text encoder hidden states.
 
@@ -245,6 +245,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         text_inputs = self.tokenizer(
             prompt,
             padding="max_length",
+            #padding="longest",
             max_length=self.tokenizer.model_max_length,
             truncation=True,
             return_tensors="pt",
@@ -290,8 +291,8 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 )
 
             focused_attention_mask = torch.zeros(
-                (batch_size, self.tokenizer.model_max_length, self.tokenizer.model_max_length)).to(device)
-            w_mask = torch.zeros((batch_size, self.tokenizer.model_max_length)).to(device)
+                (batch_size, text_embeddings.size(1), text_embeddings.size(1))).to(device)
+            w_mask = torch.zeros((batch_size, text_embeddings.size(1))).to(device)
 
             for batch_idx, f_deps in enumerate(focused_attention_dependencies):
                 sent = [re.sub("\<.*?\>", "", w) for w in self.tokenizer.convert_ids_to_tokens(text_input_ids[batch_idx], skip_special_tokens=False) if w != "!"]
@@ -314,6 +315,40 @@ class StableDiffusionPipeline(DiffusionPipeline):
             focused_attention_mask = torch.transpose(focused_attention_mask, -1, -2)
             focused_attention_mask = focused_attention_mask.repeat(1, num_images_per_prompt, 1)
             focused_attention_mask = focused_attention_mask.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+        if text_replacements is not None:
+            if batch_size != 1 and num_images_per_prompt != 1:
+                raise ValueError('text_replacements only supported with batch_size and num_images_per_prompt equal to 1')
+
+            tokenized_sent = [re.sub("\<.*?\>", "", w) for w in self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False) if w != "!"]
+            for word, repl_word, repl_prompt in text_replacements:
+                repl_ids = self.tokenizer(repl_prompt, padding="longest", return_tensors="pt").input_ids
+                repl_embeddings = self.text_encoder(repl_ids.to(device), attention_mask=None)[0]
+                repl_tokenized_sent = [re.sub("\<.*?\>", "", w) for w in self.tokenizer.convert_ids_to_tokens(repl_ids[0], skip_special_tokens=False) if w != "!"]
+                repl_w_idx = [i for i, e in enumerate(repl_tokenized_sent) if e == repl_word][0]
+                w_idx = [i for i, e in enumerate(tokenized_sent) if e == word][0]
+                text_embeddings[0, w_idx] = repl_embeddings[0, repl_w_idx]
+
+        if global_constituents is not None:
+            if batch_size != 1 and num_images_per_prompt != 1:
+                raise ValueError(
+                    'global_constituents only supported with batch_size and num_images_per_prompt equal to 1')
+
+            tokenized_sent = self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False)
+            sent = [re.sub("\<.*?\>", "", w) for w in
+                    self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False) if
+                    w != "!"]
+            g_sent_idx = tokenized_sent.index('<|endoftext|>')
+            for const_n, (const_prompt, const_dep) in enumerate(global_constituents):
+                const_ids = self.tokenizer(const_prompt, padding="longest", return_tensors="pt").input_ids
+                const_embeddings = self.text_encoder(const_ids.to(device), attention_mask=None)[0][0, -1]
+                text_embeddings[0, g_sent_idx + const_n] = const_embeddings
+
+                if const_dep is not None and focused_attention_mask is not None:
+                    const_dep_idx = sent.index(const_dep)
+                    focused_attention_mask[batch_idx, const_dep_idx, g_sent_idx + const_n] = 1
+                    w_mask[batch_idx, g_sent_idx + const_n] = 1
+
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
@@ -476,6 +511,9 @@ class StableDiffusionPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         use_focused_attention=False,
         focused_attention_dependencies=None,
+        global_text_prompt=None,
+        text_replacements=None,
+        global_constituents=None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -552,12 +590,21 @@ class StableDiffusionPipeline(DiffusionPipeline):
         if use_focused_attention:
             text_embeddings, focused_attention_mask = self._encode_prompt(
                 prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
-                focused_attention_dependencies=focused_attention_dependencies
+                focused_attention_dependencies=focused_attention_dependencies, text_replacements=text_replacements,
+                global_constituents=global_constituents
             )
         else:
             text_embeddings = self._encode_prompt(
-                prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
+                prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
+                text_replacements=text_replacements, global_constituents=global_constituents
             )
+        if global_text_prompt is not None:
+            gb_text_embeddings = self._encode_prompt(
+                global_text_prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
+            )
+            assert len(gb_text_embeddings) == len(text_embeddings)
+            text_embeddings[:, 0] = gb_text_embeddings[:, 0]
+            #text_embeddings[:, 3] = gb_text_embeddings[:, 3]
 
 
         # 4. Prepare timesteps
