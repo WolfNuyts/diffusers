@@ -223,7 +223,8 @@ class StableDiffusionPipeline(DiffusionPipeline):
         return self.device
 
     def _encode_prompt(self, prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
-                       focused_attention_dependencies=None, text_replacements=None, global_constituents=None):
+                       focused_attention_dependencies=None, text_replacements=None, global_constituents=None,
+                       remove_padding=True):
         r"""
         Encodes the prompt into text encoder hidden states.
 
@@ -264,6 +265,12 @@ class StableDiffusionPipeline(DiffusionPipeline):
             attention_mask = text_inputs.attention_mask.to(device)
         else:
             attention_mask = None
+
+        #added to
+        if remove_padding:
+            if len(text_input_ids) > 1:
+                print('WARNING: removing padding with batch size bigger than 1 does only removes padding after longest input')
+            text_input_ids = untruncated_ids
 
         text_embeddings = self.text_encoder(
             text_input_ids.to(device),
@@ -339,13 +346,28 @@ class StableDiffusionPipeline(DiffusionPipeline):
                     self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False) if
                     w != "!"]
             g_sent_idx = tokenized_sent.index('<|endoftext|>')
+
+            if text_embeddings.size(1) < g_sent_idx + len(global_constituents):
+                temp = torch.empty((text_embeddings.size(0), g_sent_idx + len(global_constituents), text_embeddings.size(2))).type(text_embeddings.dtype).to(text_embeddings.device)
+                temp[:, :text_embeddings.size(1)] = text_embeddings
+                text_embeddings = temp
+                if focused_attention_mask is not None:
+                    temp = torch.zeros(
+                        (focused_attention_mask.size(0), g_sent_idx + len(global_constituents), g_sent_idx + len(global_constituents))).type(focused_attention_mask.dtype).to(focused_attention_mask.device)
+                    temp[:, :focused_attention_mask.size(1), :focused_attention_mask.size(2)] = focused_attention_mask
+                    focused_attention_mask = temp
+                    temp = torch.zeros(
+                        (w_mask.size(0), g_sent_idx + len(global_constituents))).type(focused_attention_mask.dtype).to(focused_attention_mask.device)
+                    temp[:, :w_mask.size(1)] = w_mask
+                    w_mask = temp
+
             for const_n, (const_prompt, const_dep) in enumerate(global_constituents):
                 const_ids = self.tokenizer(const_prompt, padding="longest", return_tensors="pt").input_ids
                 const_embeddings = self.text_encoder(const_ids.to(device), attention_mask=None)[0][0, -1]
                 text_embeddings[0, g_sent_idx + const_n] = const_embeddings
 
-                if const_dep is not None and focused_attention_mask is not None:
-                    const_dep_idx = sent.index(const_dep)
+                if const_dep is not None and len(const_dep)==1 and focused_attention_mask is not None:
+                    const_dep_idx = sent.index(const_dep[0])
                     focused_attention_mask[batch_idx, const_dep_idx, g_sent_idx + const_n] = 1
                     w_mask[batch_idx, g_sent_idx + const_n] = 1
 
@@ -371,7 +393,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
             else:
                 uncond_tokens = negative_prompt
 
-            max_length = text_input_ids.shape[-1]
+            max_length = text_embeddings.size(1)
             uncond_input = self.tokenizer(
                 uncond_tokens,
                 padding="max_length",
@@ -514,6 +536,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         global_text_prompt=None,
         text_replacements=None,
         global_constituents=None,
+        remove_padding=True
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -591,21 +614,20 @@ class StableDiffusionPipeline(DiffusionPipeline):
             text_embeddings, focused_attention_mask = self._encode_prompt(
                 prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
                 focused_attention_dependencies=focused_attention_dependencies, text_replacements=text_replacements,
-                global_constituents=global_constituents
+                global_constituents=global_constituents, remove_padding=remove_padding
             )
         else:
             text_embeddings = self._encode_prompt(
                 prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
-                text_replacements=text_replacements, global_constituents=global_constituents
+                text_replacements=text_replacements, global_constituents=global_constituents,
+                remove_padding=remove_padding
             )
         if global_text_prompt is not None:
             gb_text_embeddings = self._encode_prompt(
-                global_text_prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
+                global_text_prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
+                remove_padding=remove_padding
             )
-            assert len(gb_text_embeddings) == len(text_embeddings)
-            text_embeddings[:, 0] = gb_text_embeddings[:, 0]
-            #text_embeddings[:, 3] = gb_text_embeddings[:, 3]
-
+            text_embeddings[:, -1] = gb_text_embeddings[:, -1]
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -656,7 +678,8 @@ class StableDiffusionPipeline(DiffusionPipeline):
         image = self.decode_latents(latents)
 
         # 9. Run safety checker
-        image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
+        #image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
+        has_nsfw_concept = False
 
         # 10. Convert to PIL
         if output_type == "pil":
