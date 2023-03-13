@@ -224,7 +224,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
 
     def _encode_prompt(self, prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
                        focused_attention_dependencies=None, text_replacements=None, global_constituents=None,
-                       remove_padding=True):
+                       remove_padding=False, replace_word_embeddings=False):
         r"""
         Encodes the prompt into text encoder hidden states.
 
@@ -327,14 +327,29 @@ class StableDiffusionPipeline(DiffusionPipeline):
             if batch_size != 1 and num_images_per_prompt != 1:
                 raise ValueError('text_replacements only supported with batch_size and num_images_per_prompt equal to 1')
 
-            tokenized_sent = [re.sub("\<.*?\>", "", w) for w in self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False) if w != "!"]
-            for word, repl_word, repl_prompt in text_replacements:
-                repl_ids = self.tokenizer(repl_prompt, padding="longest", return_tensors="pt").input_ids
-                repl_embeddings = self.text_encoder(repl_ids.to(device), attention_mask=None)[0]
-                repl_tokenized_sent = [re.sub("\<.*?\>", "", w) for w in self.tokenizer.convert_ids_to_tokens(repl_ids[0], skip_special_tokens=False) if w != "!"]
-                repl_w_idx = [i for i, e in enumerate(repl_tokenized_sent) if e == repl_word][0]
-                w_idx = [i for i, e in enumerate(tokenized_sent) if e == word][0]
-                text_embeddings[0, w_idx] = repl_embeddings[0, repl_w_idx]
+            if len(text_replacements[0]) == 2:
+                for repl_text, repl_prompt in text_replacements:
+                    repl_prompt_ids = self.tokenizer(repl_prompt, padding="longest", return_tensors="pt").input_ids
+                    repl_prompt_embeddings = self.text_encoder(repl_prompt_ids.to(device), attention_mask=None)[0]
+                    repl_text_ids = self.tokenizer(repl_text, padding="longest", return_tensors="pt").input_ids
+                    repl_prompt_start = _find_unique_tensor_match(repl_prompt_ids[0][1:-1], text_input_ids[0])
+                    repl_text_start = _find_unique_tensor_match(repl_text_ids[0][1:-1], repl_prompt_ids[0])
+                    t_idx = repl_prompt_start + repl_text_start - 1
+                    repl_t_idx = repl_text_start
+                    text_embeddings[0, t_idx:t_idx+len(repl_text_ids)] = repl_prompt_embeddings[0, repl_t_idx:repl_t_idx+len(repl_text_ids)]
+            else:
+                assert len(text_replacements[0]) == 3
+                tokenized_sent = [re.sub("\<.*?\>", "", w) for w in
+                                  self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False) if
+                                  w != "!"]
+
+                for word, repl_word, repl_prompt in text_replacements:
+                    repl_ids = self.tokenizer(repl_prompt, padding="longest", return_tensors="pt").input_ids
+                    repl_embeddings = self.text_encoder(repl_ids.to(device), attention_mask=None)[0]
+                    repl_tokenized_sent = [re.sub("\<.*?\>", "", w) for w in self.tokenizer.convert_ids_to_tokens(repl_ids[0], skip_special_tokens=False) if w != "!"]
+                    repl_w_idx = [i for i, e in enumerate(repl_tokenized_sent) if e == repl_word][0]
+                    w_idx = [i for i, e in enumerate(tokenized_sent) if e == word][0]
+                    text_embeddings[0, w_idx] = repl_embeddings[0, repl_w_idx]
 
         if global_constituents is not None:
             if batch_size != 1 and num_images_per_prompt != 1:
@@ -363,13 +378,22 @@ class StableDiffusionPipeline(DiffusionPipeline):
 
             for const_n, (const_prompt, const_dep) in enumerate(global_constituents):
                 const_ids = self.tokenizer(const_prompt, padding="longest", return_tensors="pt").input_ids
-                const_embeddings = self.text_encoder(const_ids.to(device), attention_mask=None)[0][0, -1]
-                text_embeddings[0, g_sent_idx + const_n] = const_embeddings
+                const_embeddings = self.text_encoder(const_ids.to(device), attention_mask=None)[0]
+                text_embeddings[0, g_sent_idx + const_n] = const_embeddings[0, -1]
 
                 if const_dep is not None and len(const_dep)==1 and focused_attention_mask is not None:
                     const_dep_idx = sent.index(const_dep[0])
                     focused_attention_mask[batch_idx, const_dep_idx, g_sent_idx + const_n] = 1
                     w_mask[batch_idx, g_sent_idx + const_n] = 1
+
+            if replace_word_embeddings:
+                tokenized_abstract_sent = self.tokenizer.convert_ids_to_tokens(const_ids[0], skip_special_tokens=False)
+                sent_idx = -1
+                for abstract_idx, word in enumerate(tokenized_abstract_sent):
+                    sent_idx = tokenized_sent[sent_idx+1:].index(word)
+                    text_embeddings[0, sent_idx] = const_embeddings[0, abstract_idx]
+
+
 
 
         # get unconditional embeddings for classifier free guidance
@@ -536,7 +560,8 @@ class StableDiffusionPipeline(DiffusionPipeline):
         global_text_prompt=None,
         text_replacements=None,
         global_constituents=None,
-        remove_padding=True
+        remove_padding=False,
+        replace_word_embeddings=False
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -614,20 +639,21 @@ class StableDiffusionPipeline(DiffusionPipeline):
             text_embeddings, focused_attention_mask = self._encode_prompt(
                 prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
                 focused_attention_dependencies=focused_attention_dependencies, text_replacements=text_replacements,
-                global_constituents=global_constituents, remove_padding=remove_padding
+                global_constituents=global_constituents, remove_padding=remove_padding,
+                replace_word_embeddings=replace_word_embeddings
             )
         else:
             text_embeddings = self._encode_prompt(
                 prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
                 text_replacements=text_replacements, global_constituents=global_constituents,
-                remove_padding=remove_padding
+                remove_padding=remove_padding, replace_word_embeddings=replace_word_embeddings
             )
         if global_text_prompt is not None:
             gb_text_embeddings = self._encode_prompt(
                 global_text_prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
                 remove_padding=remove_padding
             )
-            text_embeddings[:, -1] = gb_text_embeddings[:, -1]
+            text_embeddings[:, 0] = gb_text_embeddings[:, 0]
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -689,3 +715,14 @@ class StableDiffusionPipeline(DiffusionPipeline):
             return (image, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+
+
+def _find_unique_tensor_match(target_tensor, source_tensor):
+    match_indices = []
+    for i, repl_text_id in enumerate(target_tensor):
+        match_indices.append(((source_tensor == repl_text_id).nonzero() - i).squeeze(1).tolist())
+    elements_in_all = list(set.intersection(*map(set, match_indices)))
+    if len(elements_in_all) == 1:
+        return elements_in_all[0]
+    else:
+        raise ValueError('text_replacement not matched/multiple matches found')
