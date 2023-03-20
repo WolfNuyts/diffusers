@@ -224,7 +224,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
 
     def _encode_prompt(self, prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
                        focused_attention_dependencies=None, text_replacements=None, global_constituents=None,
-                       remove_padding=False, replace_word_embeddings=False):
+                       remove_padding=False, replace_word_embeddings=False, append_constituent_embeddings=True):
         r"""
         Encodes the prompt into text encoder hidden states.
 
@@ -362,7 +362,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
                     w != "!"]
             g_sent_idx = tokenized_sent.index('<|endoftext|>')
 
-            if text_embeddings.size(1) < g_sent_idx + len(global_constituents):
+            if append_constituent_embeddings and text_embeddings.size(1) < g_sent_idx + len(global_constituents):
                 temp = torch.empty((text_embeddings.size(0), g_sent_idx + len(global_constituents), text_embeddings.size(2))).type(text_embeddings.dtype).to(text_embeddings.device)
                 temp[:, :text_embeddings.size(1)] = text_embeddings
                 text_embeddings = temp
@@ -376,22 +376,32 @@ class StableDiffusionPipeline(DiffusionPipeline):
                     temp[:, :w_mask.size(1)] = w_mask
                     w_mask = temp
 
+            rw_embs = {}
             for const_n, (const_prompt, const_dep) in enumerate(global_constituents):
                 const_ids = self.tokenizer(const_prompt, padding="longest", return_tensors="pt").input_ids
                 const_embeddings = self.text_encoder(const_ids.to(device), attention_mask=None)[0]
-                text_embeddings[0, g_sent_idx + const_n] = const_embeddings[0, -1]
 
-                if const_dep is not None and len(const_dep)==1 and focused_attention_mask is not None:
-                    const_dep_idx = sent.index(const_dep[0])
-                    focused_attention_mask[batch_idx, const_dep_idx, g_sent_idx + const_n] = 1
-                    w_mask[batch_idx, g_sent_idx + const_n] = 1
+                if replace_word_embeddings:
+                    repl_indices = _match_token_ids(const_ids[0], text_input_ids[0])
+                    for repl_idx, sent_idx in repl_indices:
+                        if sent_idx in rw_embs:
+                            rw_embs[sent_idx] = torch.cat((rw_embs[sent_idx], const_embeddings[0, repl_idx].unsqueeze(0)), 0)
+                        else:
+                            rw_embs[sent_idx] = const_embeddings[0, repl_idx].unsqueeze(0)
+
+                if append_constituent_embeddings:
+                    text_embeddings[0, g_sent_idx + const_n] = const_embeddings[0, -1]
+
+                    if const_dep is not None and len(const_dep) == 1 and focused_attention_mask is not None:
+                        const_dep_idx = sent.index(const_dep[0])
+                        focused_attention_mask[batch_idx, const_dep_idx, g_sent_idx + const_n] = 1
+                        w_mask[batch_idx, g_sent_idx + const_n] = 1
 
             if replace_word_embeddings:
-                tokenized_abstract_sent = self.tokenizer.convert_ids_to_tokens(const_ids[0], skip_special_tokens=False)
-                sent_idx = -1
-                for abstract_idx, word in enumerate(tokenized_abstract_sent):
-                    sent_idx = tokenized_sent[sent_idx+1:].index(word)
-                    text_embeddings[0, sent_idx] = const_embeddings[0, abstract_idx]
+                for idx in rw_embs:
+                    if append_constituent_embeddings and idx == g_sent_idx:
+                        continue
+                    text_embeddings[0, idx] = rw_embs[idx].mean(dim=0)
 
 
 
@@ -557,11 +567,11 @@ class StableDiffusionPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         use_focused_attention=False,
         focused_attention_dependencies=None,
-        global_text_prompt=None,
         text_replacements=None,
         global_constituents=None,
         remove_padding=False,
-        replace_word_embeddings=False
+        replace_word_embeddings=False,
+        append_constituent_embeddings=True
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -640,21 +650,24 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
                 focused_attention_dependencies=focused_attention_dependencies, text_replacements=text_replacements,
                 global_constituents=global_constituents, remove_padding=remove_padding,
-                replace_word_embeddings=replace_word_embeddings
+                replace_word_embeddings=replace_word_embeddings, append_constituent_embeddings=append_constituent_embeddings
             )
         else:
             text_embeddings = self._encode_prompt(
                 prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
                 text_replacements=text_replacements, global_constituents=global_constituents,
-                remove_padding=remove_padding, replace_word_embeddings=replace_word_embeddings
+                remove_padding=remove_padding, replace_word_embeddings=replace_word_embeddings,
+                append_constituent_embeddings=append_constituent_embeddings
             )
+        '''
+        global_text_prompt = 'red car'
         if global_text_prompt is not None:
             gb_text_embeddings = self._encode_prompt(
                 global_text_prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt,
                 remove_padding=remove_padding
             )
             text_embeddings[:, 0] = gb_text_embeddings[:, 0]
-
+        '''
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -719,10 +732,40 @@ class StableDiffusionPipeline(DiffusionPipeline):
 
 def _find_unique_tensor_match(target_tensor, source_tensor):
     match_indices = []
-    for i, repl_text_id in enumerate(target_tensor):
-        match_indices.append(((source_tensor == repl_text_id).nonzero() - i).squeeze(1).tolist())
+    for i, target_id in enumerate(target_tensor):
+        match_indices.append(((source_tensor == target_id).nonzero() - i).squeeze(1).tolist())
     elements_in_all = list(set.intersection(*map(set, match_indices)))
     if len(elements_in_all) == 1:
         return elements_in_all[0]
     else:
         raise ValueError('text_replacement not matched/multiple matches found')
+
+
+def _match_token_ids(target_tensor, source_tensor):
+    match_indices = []
+    for i, target_id in enumerate(target_tensor):
+        match_indices.append([i, (source_tensor == target_id).nonzero().squeeze(1).tolist()])
+    avg_s_idx = []
+    for _, s_idx in match_indices:
+        if len(s_idx) == 1:
+            avg_s_idx.append(s_idx[0])
+    avg_s_idx = sum(avg_s_idx) / len(avg_s_idx)
+
+    res = []
+    for t_idx, s_idx in match_indices:
+        if len(s_idx) == 1:
+            res.append([t_idx, s_idx[0]])
+        elif len(s_idx) == 0:
+            raise ValueError('text_replacement no match found')
+        else:
+            t_indices = (target_tensor == target_tensor[t_idx]).nonzero().squeeze(1).tolist()
+            if len(t_indices) == 1:
+                res.append([t_idx, torch.argmin((torch.tensor(s_idx) - avg_s_idx).abs()).item()])
+            elif len(t_indices) == len(s_idx):
+                res.append([t_idx, s_idx[0]])
+                for t2_idx in t_indices[1:]:
+                    match_indices[t2_idx][1].pop(0)
+            else:
+                raise ValueError('text_replacement multiple matches found')
+
+    return res
