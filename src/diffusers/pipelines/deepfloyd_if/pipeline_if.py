@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import torch
 from transformers import CLIPImageProcessor, T5EncoderModel, T5Tokenizer
 
+from utils import get_lal_to_if_idx_projection
 from ...loaders import LoraLoaderMixin
 from ...models import UNet2DConditionModel
 from ...schedulers import DDPMScheduler
@@ -253,8 +254,11 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         clean_caption: bool = False,
+        use_focused_attention: bool=False,
+        lal_tokens=None,
+        lal_dependencies=None,
     ):
-        r"""
+        """
         Encodes the prompt into text encoder hidden states.
 
         Args:
@@ -342,6 +346,23 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
+        if use_focused_attention:
+            if_tokens = self.tokenizer.convert_ids_to_tokens(untruncated_ids[0], skip_special_tokens=False)
+            token_proj = get_lal_to_if_idx_projection(lal_tokens, if_tokens)
+
+            focused_attention_mask = torch.zeros(
+                (1, max_length, max_length)).to(device)
+            w_mask = torch.zeros((1, max_length)).to(device)
+
+            for f_dep in lal_dependencies:
+                # x is dependant on y:
+                focused_attention_mask[0, token_proj[f_dep[0]], token_proj[f_dep[1]]] = 1
+                w_mask[0, token_proj[f_dep[0]]] = 1
+
+            focused_attention_mask = focused_attention_mask.type(prompt_embeds.dtype)
+            focused_attention_mask = focused_attention_mask.repeat(1, num_images_per_prompt, 1)
+            focused_attention_mask = focused_attention_mask.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             uncond_tokens: List[str]
@@ -392,7 +413,16 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
         else:
             negative_prompt_embeds = None
 
-        return prompt_embeds, negative_prompt_embeds
+        if use_focused_attention:
+            uncond_focused_attention_mask = torch.zeros_like(focused_attention_mask)
+            uncond_w_mask = torch.zeros_like(w_mask)
+            focused_attention_mask = torch.cat([uncond_focused_attention_mask, focused_attention_mask])
+            w_mask = torch.cat([uncond_w_mask, w_mask])
+
+        if use_focused_attention:
+            return prompt_embeds, negative_prompt_embeds, focused_attention_mask, w_mask
+        else:
+            return prompt_embeds, negative_prompt_embeds
 
     def run_safety_checker(self, image, device, dtype):
         if self.safety_checker is not None:
