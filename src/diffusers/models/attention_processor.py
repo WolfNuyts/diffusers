@@ -683,18 +683,24 @@ class AttnAddedKVProcessor2_0:
         focused_attention_mask = torch.repeat_interleave(focused_attention_mask.unsqueeze(1), nb_heads, dim=1)
         w_mask = torch.repeat_interleave(w_mask.unsqueeze(1), nb_heads, dim=1)
 
-        attention_scores = torch.einsum("bhqd,bhkd->bhqk", query, key) / math.sqrt(query.size(-1))
-
         maximize_over_heads = cross_attention_kwargs['maximize_over_heads'] if 'maximize_over_heads' in cross_attention_kwargs else True
         maximize_with_mean = cross_attention_kwargs['maximize_with_mean'] if 'maximize_with_mean' in cross_attention_kwargs else True
         step_value = cross_attention_kwargs['step_value'] if 'step_value' in cross_attention_kwargs else 0.6
         reweight_att_scores = cross_attention_kwargs['reweight_att_scores'] if 'reweight_att_scores' in cross_attention_kwargs else True
+        use_foc_cfg = cross_attention_kwargs['use_foc_cfg'] if 'use_foc_cfg' in cross_attention_kwargs else False
 
         foc_att_weights = None
         if 'att_acc' in cross_attention_kwargs:
             foc_att_weights = cross_attention_kwargs['att_acc'].get_att_maps()
         elif 'foc_att_weights' in cross_attention_kwargs:
             foc_att_weights = cross_attention_kwargs['foc_att_weights']
+        if use_foc_cfg and foc_att_weights is not None:
+            key[0, :, :w_mask.size(-1)][w_mask[1]==1] = key[1, :, :w_mask.size(-1)][w_mask[1]==1]
+            value[0, :, :w_mask.size(-1)][w_mask[1]==1] = value[1, :, :w_mask.size(-1)][w_mask[1]==1]
+
+
+        attention_scores = torch.einsum("bhqd,bhkd->bhqk", query, key) / math.sqrt(query.size(-1))
+
 
         if foc_att_weights is not None:
             dim_size = int(math.sqrt(attention_scores.size(2)))
@@ -713,6 +719,9 @@ class AttnAddedKVProcessor2_0:
                 focus_weights = torch.where(focus_weights > step_value, torch.ones_like(focus_weights), torch.zeros_like(focus_weights))
             focus_weights = torch.maximum(focus_weights, torch.logical_not(w_mask)[:, :, None, :focus_weights.size(-1)])
 
+            if use_foc_cfg:
+                m = torch.repeat_interleave(w_mask[1, :, None, :foc_att_weights.size(2)] == 1, focus_weights.size(2), dim=1)
+                focus_weights[0, m] = 1-focus_weights[1, m]
 
         else:
             focus_weights = torch.einsum("bhqk,bhdk->bhqd", attention_scores[:, :, :, :focused_attention_mask.size(-1)],
