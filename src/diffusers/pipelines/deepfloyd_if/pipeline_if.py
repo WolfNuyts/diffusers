@@ -7,7 +7,6 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import torch
 from transformers import CLIPImageProcessor, T5EncoderModel, T5Tokenizer
 
-from utils import get_lal_to_if_idx_projection
 from ...loaders import LoraLoaderMixin
 from ...models import UNet2DConditionModel
 from ...schedulers import DDPMScheduler
@@ -243,6 +242,19 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
 
+    def get_lal_to_if_idx_projection(self, lal_tokens, if_tokens):
+        result = {}
+        lal_idx = 0
+        if_tokens = [re.sub(r'▁', '', text) for text in if_tokens]
+        for i, if_token in enumerate(if_tokens):
+            if if_token == '</s>':
+                break
+            elif if_token == lal_tokens[lal_idx]:
+                result[lal_idx] = i
+                lal_idx += 1
+        assert lal_idx == len(lal_tokens)
+        return result
+
     @torch.no_grad()
     def encode_prompt(
         self,
@@ -348,7 +360,7 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
 
         if use_focused_attention:
             if_tokens = self.tokenizer.convert_ids_to_tokens(untruncated_ids[0], skip_special_tokens=False)
-            token_proj = get_lal_to_if_idx_projection(lal_tokens, if_tokens)
+            token_proj = self.get_lal_to_if_idx_projection(lal_tokens, if_tokens)
 
             focused_attention_mask = torch.zeros(
                 (1, max_length, max_length)).to(device)
@@ -407,17 +419,17 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
             negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
             negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
+            if use_focused_attention:
+                uncond_focused_attention_mask = torch.zeros_like(focused_attention_mask)
+                uncond_w_mask = torch.zeros_like(w_mask)
+                focused_attention_mask = torch.cat([uncond_focused_attention_mask, focused_attention_mask])
+                w_mask = torch.cat([uncond_w_mask, w_mask])
+
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
         else:
             negative_prompt_embeds = None
-
-        if use_focused_attention:
-            uncond_focused_attention_mask = torch.zeros_like(focused_attention_mask)
-            uncond_w_mask = torch.zeros_like(w_mask)
-            focused_attention_mask = torch.cat([uncond_focused_attention_mask, focused_attention_mask])
-            w_mask = torch.cat([uncond_w_mask, w_mask])
 
         if use_focused_attention:
             return prompt_embeds, negative_prompt_embeds, focused_attention_mask, w_mask

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import re
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -285,6 +286,49 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 return torch.device(module._hf_hook.execution_device)
         return self.device
 
+    def get_lal_to_clip_idx_projection(self, lal_tokens, clip_tokens):
+        result = {}
+        lal_idx = 0
+        clip_tokens = [re.sub('<\|endoftext\|>', '|endoftext|', text) for text in clip_tokens]
+        clip_tokens = [re.sub(r'<(.*?)>', '', text) for text in clip_tokens]
+        for i, clip_token in enumerate(clip_tokens):
+            if clip_token == '|endoftext|':
+                break
+            elif clip_token == lal_tokens[lal_idx]:
+                result[lal_idx] = i
+                lal_idx += 1
+        assert lal_idx == len(lal_tokens)
+        return result
+
+    def _match_token_ids(self, target_tensor, source_tensor):
+        match_indices = []
+        for i, target_id in enumerate(target_tensor):
+            match_indices.append([i, (source_tensor == target_id).nonzero().squeeze(1).tolist()])
+        avg_s_idx = []
+        for _, s_idx in match_indices:
+            if len(s_idx) == 1:
+                avg_s_idx.append(s_idx[0])
+        avg_s_idx = sum(avg_s_idx) / len(avg_s_idx)
+
+        res = []
+        for t_idx, s_idx in match_indices:
+            if len(s_idx) == 1:
+                res.append([t_idx, s_idx[0]])
+            elif len(s_idx) == 0:
+                raise ValueError('text_replacement no match found')
+            else:
+                t_indices = (target_tensor == target_tensor[t_idx]).nonzero().squeeze(1).tolist()
+                if len(t_indices) == 1:
+                    res.append([t_idx, torch.argmin((torch.tensor(s_idx) - avg_s_idx).abs()).item()])
+                elif len(t_indices) == len(s_idx):
+                    res.append([t_idx, s_idx[0]])
+                    for t2_idx in t_indices[1:]:
+                        match_indices[t2_idx][1].pop(0)
+                else:
+                    raise ValueError('text_replacement multiple matches found')
+
+        return res
+
     def _encode_prompt(
         self,
         prompt,
@@ -294,6 +338,13 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         negative_prompt=None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        use_focused_attention=False,
+        lal_tokens=None,
+        lal_dependencies=None,
+        global_constituents=None,
+        remove_padding=False,
+        replace_word_embeddings=True,
+        append_constituent_embeddings=True,
     ):
         r"""
         Encodes the prompt into text encoder hidden states.
@@ -357,6 +408,13 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             else:
                 attention_mask = None
 
+            # added to remove padding
+            if remove_padding:
+                if len(text_input_ids) > 1:
+                    print(
+                        'WARNING: removing padding with batch size bigger than 1 does only removes padding after longest input')
+                text_input_ids = untruncated_ids
+
             prompt_embeds = self.text_encoder(
                 text_input_ids.to(device),
                 attention_mask=attention_mask,
@@ -369,6 +427,78 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         # duplicate text embeddings for each generation per prompt, using mps friendly method
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+        focused_attention_mask, w_mask = None, None
+        if use_focused_attention:
+            max_length = prompt_embeds.size(1)
+            clip_tokens = self.tokenizer.convert_ids_to_tokens(untruncated_ids[0], skip_special_tokens=False)
+            token_proj = self.get_lal_to_clip_idx_projection(lal_tokens, clip_tokens)
+
+            focused_attention_mask = torch.zeros(
+                (1, max_length, max_length)).to(device)
+            w_mask = torch.zeros((1, max_length)).to(device)
+
+            for f_dep in lal_dependencies:
+                # x is dependant on y:
+                focused_attention_mask[0, token_proj[f_dep[0]], token_proj[f_dep[1]]] = 1
+                w_mask[0, token_proj[f_dep[0]]] = 1
+
+            focused_attention_mask = focused_attention_mask.type(prompt_embeds.dtype)
+            focused_attention_mask = focused_attention_mask.repeat(1, num_images_per_prompt, 1)
+            focused_attention_mask = focused_attention_mask.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+        if global_constituents is not None:
+            if batch_size != 1 and num_images_per_prompt != 1:
+                raise ValueError(
+                    'global_constituents only supported with batch_size and num_images_per_prompt equal to 1')
+
+            tokenized_sent = self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False)
+            sent = [re.sub("\<.*?\>", "", w) for w in
+                    self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False) if
+                    w != "!"]
+            g_sent_idx = tokenized_sent.index('<|endoftext|>')
+
+            if append_constituent_embeddings and prompt_embeds.size(1) < g_sent_idx + len(global_constituents):
+                temp = torch.empty((prompt_embeds.size(0), g_sent_idx + len(global_constituents), prompt_embeds.size(2))).type(prompt_embeds.dtype).to(prompt_embeds.device)
+                temp[:, :prompt_embeds.size(1)] = prompt_embeds
+                prompt_embeds = temp
+                if focused_attention_mask is not None:
+                    temp = torch.zeros(
+                        (focused_attention_mask.size(0), g_sent_idx + len(global_constituents), g_sent_idx + len(global_constituents))).type(focused_attention_mask.dtype).to(focused_attention_mask.device)
+                    temp[:, :focused_attention_mask.size(1), :focused_attention_mask.size(2)] = focused_attention_mask
+                    focused_attention_mask = temp
+                    temp = torch.zeros(
+                        (w_mask.size(0), g_sent_idx + len(global_constituents))).type(focused_attention_mask.dtype).to(focused_attention_mask.device)
+                    temp[:, :w_mask.size(1)] = w_mask
+                    w_mask = temp
+
+            rw_embs = {}
+            for const_n, (const_prompt, const_dep) in enumerate(global_constituents):
+                const_ids = self.tokenizer(const_prompt, padding="longest", return_tensors="pt").input_ids
+                const_embeddings = self.text_encoder(const_ids.to(device), attention_mask=None)[0]
+
+                if replace_word_embeddings:
+                    repl_indices = self._match_token_ids(const_ids[0], text_input_ids[0])
+                    for repl_idx, sent_idx in repl_indices:
+                        if sent_idx in rw_embs:
+                            rw_embs[sent_idx] = torch.cat((rw_embs[sent_idx], const_embeddings[0, repl_idx].unsqueeze(0)), 0)
+                        else:
+                            rw_embs[sent_idx] = const_embeddings[0, repl_idx].unsqueeze(0)
+
+                if append_constituent_embeddings:
+                    prompt_embeds[0, g_sent_idx + const_n] = const_embeddings[0, -1]
+
+                    if const_dep is not None and len(const_dep) == 1 and focused_attention_mask is not None:
+                        const_dep_idx = sent.index(const_dep[0])
+                        focused_attention_mask[0, g_sent_idx + const_n, const_dep_idx] = 1
+                        w_mask[0, g_sent_idx + const_n] = 1
+
+            if replace_word_embeddings:
+                for idx in rw_embs:
+                    if append_constituent_embeddings and idx == g_sent_idx:
+                        continue
+                    #prompt_embeds[0, idx] = rw_embs[idx].mean(dim=0)
+                    prompt_embeds[0, idx] = rw_embs[idx][-1]
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
@@ -427,7 +557,18 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
+
+            if use_focused_attention:
+                uncond_focused_attention_mask = torch.zeros_like(focused_attention_mask)
+                uncond_w_mask = torch.zeros_like(w_mask)
+                focused_attention_mask = torch.cat([uncond_focused_attention_mask, focused_attention_mask])
+                w_mask = torch.cat([uncond_w_mask, w_mask])
+                return prompt_embeds, negative_prompt_embeds, focused_attention_mask, w_mask
+
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+
+        if use_focused_attention:
+            return prompt_embeds, focused_attention_mask, w_mask
 
         return prompt_embeds
 
@@ -717,7 +858,8 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
 
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            has_nsfw_concept = None
+            #image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
             image = latents
             has_nsfw_concept = None

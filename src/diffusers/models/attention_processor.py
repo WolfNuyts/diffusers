@@ -948,7 +948,8 @@ class AttnProcessor2_0:
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
-    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None):
+    def focused_attention(self, attn: Attention, hidden_states, focused_attention_mask, w_mask,
+                          encoder_hidden_states=None, attention_mask=None, **cross_attention_kwargs):
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
@@ -963,6 +964,149 @@ class AttnProcessor2_0:
         query = attn.to_q(hidden_states)
 
         if encoder_hidden_states is None:
+            assert False
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        head_dim = inner_dim // attn.heads
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        # added focused attention code:
+        nb_heads = query.size(1)
+        focused_attention_mask = torch.repeat_interleave(focused_attention_mask.unsqueeze(1), nb_heads, dim=1)
+        w_mask = torch.repeat_interleave(w_mask.unsqueeze(1), nb_heads, dim=1)
+
+        maximize_over_heads = cross_attention_kwargs[
+            'maximize_over_heads'] if 'maximize_over_heads' in cross_attention_kwargs else True
+        maximize_with_mean = cross_attention_kwargs[
+            'maximize_with_mean'] if 'maximize_with_mean' in cross_attention_kwargs else True
+        step_value = cross_attention_kwargs['step_value'] if 'step_value' in cross_attention_kwargs else 0.6
+        reweight_att_scores = cross_attention_kwargs[
+            'reweight_att_scores'] if 'reweight_att_scores' in cross_attention_kwargs else True
+        use_foc_cfg = cross_attention_kwargs['use_foc_cfg'] if 'use_foc_cfg' in cross_attention_kwargs else False
+
+        foc_att_weights = None
+        if 'att_acc' in cross_attention_kwargs:
+            foc_att_weights = cross_attention_kwargs['att_acc'].get_att_maps()
+        elif 'foc_att_weights' in cross_attention_kwargs:
+            foc_att_weights = cross_attention_kwargs['foc_att_weights']
+        if use_foc_cfg and foc_att_weights is not None:
+            key[0, :, :w_mask.size(-1)][w_mask[1] == 1] = key[1, :, :w_mask.size(-1)][w_mask[1] == 1]
+            value[0, :, :w_mask.size(-1)][w_mask[1] == 1] = value[1, :, :w_mask.size(-1)][w_mask[1] == 1]
+
+        attention_scores = torch.einsum("bhqd,bhkd->bhqk", query, key) / math.sqrt(query.size(-1))
+
+        if foc_att_weights is not None:
+            dim_size = int(math.sqrt(attention_scores.size(2)))
+            assert foc_att_weights.size(-1) % dim_size == 0
+            ds_ratio = foc_att_weights.size(-1) // dim_size
+            if ds_ratio > 1:
+                maxpool = torch.nn.MaxPool2d(ds_ratio, stride=ds_ratio)
+                foc_att_weights = maxpool(foc_att_weights)
+            foc_att_weights = foc_att_weights.view(1, foc_att_weights.size(0), dim_size ** 2)
+            foc_att_weights = torch.repeat_interleave(foc_att_weights.unsqueeze(1), nb_heads, dim=1)
+            foc_att_weights = torch.vstack([torch.zeros_like(foc_att_weights), foc_att_weights]).type(
+                focused_attention_mask.dtype).to(focused_attention_mask.device)
+            focus_weights = torch.einsum("bhkq,bhdk->bhqd", foc_att_weights,
+                                         focused_attention_mask[:, :, :foc_att_weights.size(2),
+                                         :foc_att_weights.size(2)])
+            focus_weights = torch.clamp(focus_weights, min=0)
+            focus_weights /= (focus_weights.max(dim=2, keepdim=True)[0] + 1e-6)
+            if step_value is not None:
+                focus_weights = torch.where(focus_weights > step_value, torch.ones_like(focus_weights),
+                                            torch.zeros_like(focus_weights))
+            focus_weights = torch.maximum(focus_weights, torch.logical_not(w_mask)[:, :, None, :focus_weights.size(-1)])
+
+            if use_foc_cfg:
+                m = torch.repeat_interleave(w_mask[1, :, None, :foc_att_weights.size(2)] == 1, focus_weights.size(2),
+                                            dim=1)
+                focus_weights[0, m] = 1 - focus_weights[1, m]
+
+        else:
+            focus_weights = torch.einsum("bhqk,bhdk->bhqd", attention_scores[:, :, :, :focused_attention_mask.size(-1)],
+                                         focused_attention_mask
+                                         )
+            focus_weights = torch.clamp(focus_weights, min=0)
+            if maximize_over_heads:
+                if maximize_with_mean:
+                    focus_weights = focus_weights.mean(dim=1)
+                else:
+                    focus_weights = focus_weights.max(dim=1)[0]
+                focus_weights = torch.repeat_interleave(focus_weights.unsqueeze(1), nb_heads, dim=1)
+
+            focus_weights /= (focus_weights.max(dim=2, keepdim=True)[0] + 1e-6)
+            if step_value is not None:
+                focus_weights = torch.where(focus_weights > step_value, torch.ones_like(focus_weights),
+                                            torch.zeros_like(focus_weights))
+            focus_weights = torch.maximum(focus_weights, torch.logical_not(w_mask)[:, :, None, :focus_weights.size(-1)])
+
+        if reweight_att_scores:
+            m1 = attention_scores.amax(dim=2)[:, :, None, :focus_weights.size(-1)]
+            m1[m1 < 0] = 0.0001
+            attention_scores[:, :, :, :focus_weights.size(-1)] += (focus_weights - 1) * 50
+            m2 = attention_scores.amax(dim=2)[:, :, None, :focus_weights.size(-1)]
+            m2[m2 < 0] = 0.0001
+            weight = m1 / m2
+            attention_scores[:, :, :, :focus_weights.size(-1)] *= weight
+        else:
+            attention_scores[:, :, :, :focus_weights.size(-1)] += (focus_weights - 1) * 50
+        attn_slice = attention_scores.softmax(dim=-1)
+        hidden_states = torch.einsum("bhqk,bhkv->bhqv", attn_slice, value)
+
+        if 'att_acc' in cross_attention_kwargs:
+            cross_attention_kwargs['att_acc'].add_att_maps(attn_slice)
+        if 'att_vis' in cross_attention_kwargs:
+            cross_attention_kwargs['att_vis'].add_att_maps(attn_slice.cpu())
+        if 'foc_att_vis' in cross_attention_kwargs:
+            cross_attention_kwargs['foc_att_vis'].add_att_maps(focus_weights.cpu())
+
+        '''# the output of sdp = (batch, num_heads, seq_len, head_dim)
+        # TODO: add support for attn.scale when we move to Torch 2.1
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )'''
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None,  **cross_attention_kwargs):
+
+        if encoder_hidden_states is not None and 'foc_att_mask' in cross_attention_kwargs and cross_attention_kwargs['foc_att_mask'] is not None:
+            return self.focused_attention(attn,
+                                          hidden_states,
+                                          cross_attention_kwargs['foc_att_mask'],
+                                          cross_attention_kwargs['foc_att_w'],
+                                          encoder_hidden_states=encoder_hidden_states,
+                                          attention_mask=attention_mask,
+                                          **cross_attention_kwargs)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        inner_dim = hidden_states.shape[-1]
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            # scaled_dot_product_attention expects attention_mask shape to be
+            # (batch, heads, source_length, target_length)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+        query = attn.to_q(hidden_states)
+
+        self_attention = False
+        if encoder_hidden_states is None:
+            self_attention = True
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
@@ -980,6 +1124,11 @@ class AttnProcessor2_0:
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
+
+        if 'att_vis' in cross_attention_kwargs and not self_attention:
+            attention_scores = torch.einsum("bhqd,bhkd->bhqk", query, key) / math.sqrt(query.size(-1))
+            attn_slice = attention_scores.softmax(dim=-1)
+            cross_attention_kwargs['att_vis'].add_att_maps(attn_slice.cpu())
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
