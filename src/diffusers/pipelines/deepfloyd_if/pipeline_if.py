@@ -246,13 +246,20 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
         result = {}
         lal_idx = 0
         if_tokens = [re.sub(r'▁', '', text) for text in if_tokens]
-        for i, if_token in enumerate(if_tokens):
-            if if_token == '</s>':
-                break
-            elif if_token == lal_tokens[lal_idx]:
-                result[lal_idx] = i
+        last_assignment = 0
+        while lal_idx < len(lal_tokens):
+            for i in range(last_assignment, len(if_tokens)):
+                if_token = if_tokens[i]
+                if if_token == '</s>' or lal_idx == len(lal_tokens):
+                    break
+                elif if_token.casefold() == lal_tokens[lal_idx].casefold():
+                    result[lal_idx] = i
+                    lal_idx += 1
+            if lal_idx < len(lal_tokens):
+                result[lal_idx] = last_assignment + 1
+                last_assignment += 1
                 lal_idx += 1
-        assert lal_idx == len(lal_tokens)
+
         return result
 
     @torch.no_grad()

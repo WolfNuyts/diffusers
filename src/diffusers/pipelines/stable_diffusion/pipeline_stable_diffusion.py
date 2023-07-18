@@ -291,41 +291,61 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         lal_idx = 0
         clip_tokens = [re.sub('<\|endoftext\|>', '|endoftext|', text) for text in clip_tokens]
         clip_tokens = [re.sub(r'<(.*?)>', '', text) for text in clip_tokens]
-        for i, clip_token in enumerate(clip_tokens):
-            if clip_token == '|endoftext|':
-                break
-            elif clip_token == lal_tokens[lal_idx]:
-                result[lal_idx] = i
+        last_assignment = 0
+        while lal_idx < len(lal_tokens):
+            for i in range(last_assignment, len(clip_tokens)):
+                clip_token = clip_tokens[i]
+                if clip_token == '|endoftext|' or lal_idx == len(lal_tokens):
+                    break
+                elif clip_token.casefold() == lal_tokens[lal_idx].casefold():
+                    result[lal_idx] = i
+                    last_assignment = i
+                    lal_idx += 1
+            if lal_idx < len(lal_tokens):
+                result[lal_idx] = last_assignment + 1
+                last_assignment += 1
                 lal_idx += 1
-        assert lal_idx == len(lal_tokens)
         return result
 
     def _match_token_ids(self, target_tensor, source_tensor):
         match_indices = []
         for i, target_id in enumerate(target_tensor):
             match_indices.append([i, (source_tensor == target_id).nonzero().squeeze(1).tolist()])
-        avg_s_idx = []
-        for _, s_idx in match_indices:
-            if len(s_idx) == 1:
-                avg_s_idx.append(s_idx[0])
-        avg_s_idx = sum(avg_s_idx) / len(avg_s_idx)
 
         res = []
+        difficult_cases = []
         for t_idx, s_idx in match_indices:
             if len(s_idx) == 1:
                 res.append([t_idx, s_idx[0]])
             elif len(s_idx) == 0:
                 raise ValueError('text_replacement no match found')
             else:
+                difficult_cases.append([t_idx, s_idx])
+
+        for t_idx, s_idx in difficult_cases:
                 t_indices = (target_tensor == target_tensor[t_idx]).nonzero().squeeze(1).tolist()
-                if len(t_indices) == 1:
-                    res.append([t_idx, torch.argmin((torch.tensor(s_idx) - avg_s_idx).abs()).item()])
-                elif len(t_indices) == len(s_idx):
-                    res.append([t_idx, s_idx[0]])
-                    for t2_idx in t_indices[1:]:
-                        match_indices[t2_idx][1].pop(0)
+                if len(res) > 2:
+                    avg_idx = torch.tensor(res[1:-1])[:, 1].float().mean()
                 else:
-                    raise ValueError('text_replacement multiple matches found')
+                    avg_idx = 0
+                if len(t_indices) == 1:
+                    closest_idx = torch.argmin((torch.tensor(s_idx) - avg_idx).abs()).item()
+                    res.append([t_idx, s_idx[closest_idx]])
+
+                elif len(t_indices) <= len(s_idx):
+                    while len(t_indices) != len(s_idx):
+                        worst_idx = torch.argmax((torch.tensor(s_idx) - avg_idx).abs()).item()
+                        s_idx.pop(worst_idx)
+                    res.append([t_idx, s_idx[0]])
+                    for j, t2_idx in enumerate(t_indices[1:], start=1):
+                        for case_idx, case in enumerate(difficult_cases):
+                            if case[0] == t2_idx:
+                                res.append([t2_idx, s_idx[j]])
+                                difficult_cases.pop(case_idx)
+                                break
+
+                else:
+                    raise ValueError('text_replacement no match found')
 
         return res
 
@@ -344,6 +364,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         global_constituents=None,
         remove_padding=False,
         replace_word_embeddings=True,
+        replace_with_leaf=False,
         append_constituent_embeddings=True,
     ):
         r"""
@@ -413,6 +434,11 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 if len(text_input_ids) > 1:
                     print(
                         'WARNING: removing padding with batch size bigger than 1 does only removes padding after longest input')
+                if untruncated_ids.shape[-1] > text_input_ids.shape[-1]:
+                    mask = torch.zeros_like(untruncated_ids).bool()
+                    mask[..., :text_input_ids.shape[-1]-1] = True
+                    mask[..., -1] = True
+                    untruncated_ids = untruncated_ids[mask]
                 text_input_ids = untruncated_ids
 
             prompt_embeds = self.text_encoder(
@@ -451,6 +477,8 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             if batch_size != 1 and num_images_per_prompt != 1:
                 raise ValueError(
                     'global_constituents only supported with batch_size and num_images_per_prompt equal to 1')
+            if append_constituent_embeddings and len(global_constituents) + text_input_ids.shape[-1] > 77:
+                append_constituent_embeddings = False
 
             tokenized_sent = self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False)
             sent = [re.sub("\<.*?\>", "", w) for w in
@@ -489,7 +517,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                     prompt_embeds[0, g_sent_idx + const_n] = const_embeddings[0, -1]
 
                     if const_dep is not None and len(const_dep) == 1 and focused_attention_mask is not None:
-                        const_dep_idx = sent.index(const_dep[0])
+                        const_dep_idx = token_proj[lal_tokens.index(const_dep[0])]
                         focused_attention_mask[0, g_sent_idx + const_n, const_dep_idx] = 1
                         w_mask[0, g_sent_idx + const_n] = 1
 
@@ -497,8 +525,10 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 for idx in rw_embs:
                     if append_constituent_embeddings and idx == g_sent_idx:
                         continue
-                    #prompt_embeds[0, idx] = rw_embs[idx].mean(dim=0)
-                    prompt_embeds[0, idx] = rw_embs[idx][-1]
+                    if replace_with_leaf:
+                        prompt_embeds[0, idx] = rw_embs[idx][0]
+                    else:
+                        prompt_embeds[0, idx] = rw_embs[idx].mean(dim=0)
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
