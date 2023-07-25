@@ -318,7 +318,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             if len(s_idx) == 1:
                 res.append([t_idx, s_idx[0]])
             elif len(s_idx) == 0:
-                raise ValueError('text_replacement no match found')
+                continue
             else:
                 difficult_cases.append([t_idx, s_idx])
 
@@ -345,7 +345,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                                 break
 
                 else:
-                    raise ValueError('text_replacement no match found')
+                    continue
 
         return res
 
