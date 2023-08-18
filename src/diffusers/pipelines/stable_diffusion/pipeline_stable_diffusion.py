@@ -286,6 +286,8 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 return torch.device(module._hf_hook.execution_device)
         return self.device
 
+    #####################
+    # function used to find which tokens in the lal representation correspond to which tokens from the CLIP representation
     def get_lal_to_clip_idx_projection(self, lal_tokens, clip_tokens):
         result = {}
         lal_idx = 0
@@ -306,7 +308,11 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 last_assignment += 1
                 lal_idx += 1
         return result
+    #####################
 
+    #####################
+    # function used in DisCLIP-leaf and DisCLIP-avg to find for each word of a constituency encoding to which word of
+    # the whole sentence encoding it belongs
     def _match_token_ids(self, target_tensor, source_tensor):
         match_indices = []
         for i, target_id in enumerate(target_tensor):
@@ -348,6 +354,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                     continue
 
         return res
+    #####################
 
     def _encode_prompt(
         self,
@@ -361,11 +368,9 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         use_focused_attention=False,
         lal_tokens=None,
         lal_dependencies=None,
-        global_constituents=None,
+        used_CLIP_variant='CLIP',
+        DisCLIP_constituents=None,
         remove_padding=False,
-        replace_word_embeddings=True,
-        replace_with_leaf=False,
-        append_constituent_embeddings=True,
     ):
         r"""
         Encodes the prompt into text encoder hidden states.
@@ -429,6 +434,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             else:
                 attention_mask = None
 
+            #####################
             # added to remove padding
             if remove_padding:
                 if len(text_input_ids) > 1:
@@ -440,6 +446,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                     mask[..., -1] = True
                     untruncated_ids = untruncated_ids[mask]
                 text_input_ids = untruncated_ids
+            #####################
 
             prompt_embeds = self.text_encoder(
                 text_input_ids.to(device),
@@ -454,58 +461,63 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
-        focused_attention_mask, w_mask = None, None
+        #####################
+        # calculate the dependency matrix 
+        dependency_matrix, attribute_mask = None, None
         if use_focused_attention:
             max_length = prompt_embeds.size(1)
             clip_tokens = self.tokenizer.convert_ids_to_tokens(untruncated_ids[0], skip_special_tokens=False)
             token_proj = self.get_lal_to_clip_idx_projection(lal_tokens, clip_tokens)
 
-            focused_attention_mask = torch.zeros(
+            dependency_matrix = torch.zeros(
                 (1, max_length, max_length)).to(device)
-            w_mask = torch.zeros((1, max_length)).to(device)
+            attribute_mask = torch.zeros((1, max_length)).to(device)
 
             for f_dep in lal_dependencies:
                 # x is dependant on y:
-                focused_attention_mask[0, token_proj[f_dep[0]], token_proj[f_dep[1]]] = 1
-                w_mask[0, token_proj[f_dep[0]]] = 1
+                dependency_matrix[0, token_proj[f_dep[0]], token_proj[f_dep[1]]] = 1
+                attribute_mask[0, token_proj[f_dep[0]]] = 1
 
-            focused_attention_mask = focused_attention_mask.type(prompt_embeds.dtype)
-            focused_attention_mask = focused_attention_mask.repeat(1, num_images_per_prompt, 1)
-            focused_attention_mask = focused_attention_mask.view(bs_embed * num_images_per_prompt, seq_len, -1)
-
-        if global_constituents is not None:
+            dependency_matrix = dependency_matrix.type(prompt_embeds.dtype)
+            dependency_matrix = dependency_matrix.repeat(1, num_images_per_prompt, 1)
+            dependency_matrix = dependency_matrix.view(bs_embed * num_images_per_prompt, seq_len, -1)
+        
+        # replace the CLIP embedding by DisCLIP
+        if used_CLIP_variant in ['DisCLIP', 'DisCLIP-leaf', 'DisCLIP-avg']:
+            assert DisCLIP_constituents is not None
             if batch_size != 1 and num_images_per_prompt != 1:
                 raise ValueError(
-                    'global_constituents only supported with batch_size and num_images_per_prompt equal to 1')
-            if append_constituent_embeddings and len(global_constituents) + text_input_ids.shape[-1] > 77:
-                append_constituent_embeddings = False
+                    'DisCLIP only supported with batch_size and num_images_per_prompt equal to 1')
+
+            # if appending the constituent embeddings results in a encoding length over the maximum length,
+            # we do not append the constituent embeddings for this sample
+            append_constituent_embeddings = True if len(DisCLIP_constituents) + text_input_ids.shape[-1] <= 77 else False
 
             tokenized_sent = self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False)
-            sent = [re.sub("\<.*?\>", "", w) for w in
-                    self.tokenizer.convert_ids_to_tokens(text_input_ids[0], skip_special_tokens=False) if
-                    w != "!"]
             g_sent_idx = tokenized_sent.index('<|endoftext|>')
-
-            if append_constituent_embeddings and prompt_embeds.size(1) < g_sent_idx + len(global_constituents):
-                temp = torch.empty((prompt_embeds.size(0), g_sent_idx + len(global_constituents), prompt_embeds.size(2))).type(prompt_embeds.dtype).to(prompt_embeds.device)
+            # we add rows if needed to prompt embedding and dependency matrix
+            if append_constituent_embeddings and prompt_embeds.size(1) < g_sent_idx + len(DisCLIP_constituents):
+                temp = torch.empty((prompt_embeds.size(0), g_sent_idx + len(DisCLIP_constituents), prompt_embeds.size(2))).type(prompt_embeds.dtype).to(prompt_embeds.device)
                 temp[:, :prompt_embeds.size(1)] = prompt_embeds
                 prompt_embeds = temp
-                if focused_attention_mask is not None:
+                if dependency_matrix is not None:
                     temp = torch.zeros(
-                        (focused_attention_mask.size(0), g_sent_idx + len(global_constituents), g_sent_idx + len(global_constituents))).type(focused_attention_mask.dtype).to(focused_attention_mask.device)
-                    temp[:, :focused_attention_mask.size(1), :focused_attention_mask.size(2)] = focused_attention_mask
-                    focused_attention_mask = temp
+                        (dependency_matrix.size(0), g_sent_idx + len(DisCLIP_constituents), g_sent_idx + len(DisCLIP_constituents))).type(dependency_matrix.dtype).to(dependency_matrix.device)
+                    temp[:, :dependency_matrix.size(1), :dependency_matrix.size(2)] = dependency_matrix
+                    dependency_matrix = temp
                     temp = torch.zeros(
-                        (w_mask.size(0), g_sent_idx + len(global_constituents))).type(focused_attention_mask.dtype).to(focused_attention_mask.device)
-                    temp[:, :w_mask.size(1)] = w_mask
-                    w_mask = temp
+                        (attribute_mask.size(0), g_sent_idx + len(DisCLIP_constituents))).type(dependency_matrix.dtype).to(dependency_matrix.device)
+                    temp[:, :attribute_mask.size(1)] = attribute_mask
+                    attribute_mask = temp
 
+            # we iterate over all the constituents
             rw_embs = {}
-            for const_n, (const_prompt, const_dep) in enumerate(global_constituents):
+            for const_n, (const_prompt, const_dep) in enumerate(DisCLIP_constituents):
                 const_ids = self.tokenizer(const_prompt, padding="longest", return_tensors="pt").input_ids
                 const_embeddings = self.text_encoder(const_ids.to(device), attention_mask=None)[0]
 
-                if replace_word_embeddings:
+                # we keep the word embeddings of the constituents in a dictionary if using 'DisCLIP-leaf' or 'DisCLIP-avg'
+                if used_CLIP_variant in ['DisCLIP-leaf', 'DisCLIP-avg']:
                     repl_indices = self._match_token_ids(const_ids[0], text_input_ids[0])
                     for repl_idx, sent_idx in repl_indices:
                         if sent_idx in rw_embs:
@@ -513,22 +525,29 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                         else:
                             rw_embs[sent_idx] = const_embeddings[0, repl_idx].unsqueeze(0)
 
+                # we append the constituent sentence embeddings
                 if append_constituent_embeddings:
                     prompt_embeds[0, g_sent_idx + const_n] = const_embeddings[0, -1]
 
-                    if const_dep is not None and len(const_dep) == 1 and focused_attention_mask is not None:
+                    if const_dep is not None and len(const_dep) == 1 and dependency_matrix is not None:
                         const_dep_idx = token_proj[lal_tokens.index(const_dep[0])]
-                        focused_attention_mask[0, g_sent_idx + const_n, const_dep_idx] = 1
-                        w_mask[0, g_sent_idx + const_n] = 1
+                        dependency_matrix[0, g_sent_idx + const_n, const_dep_idx] = 1
+                        attribute_mask[0, g_sent_idx + const_n] = 1
 
-            if replace_word_embeddings:
+            # replace the word embeddings for DisCLIP-leaf
+            if used_CLIP_variant == 'DisCLIP-leaf':
                 for idx in rw_embs:
                     if append_constituent_embeddings and idx == g_sent_idx:
                         continue
-                    if replace_with_leaf:
-                        prompt_embeds[0, idx] = rw_embs[idx][0]
-                    else:
-                        prompt_embeds[0, idx] = rw_embs[idx].mean(dim=0)
+                    prompt_embeds[0, idx] = rw_embs[idx][0]
+
+            # replace the word embeddings for DisCLIP-avg
+            if used_CLIP_variant == 'DisCLIP-avg':
+                for idx in rw_embs:
+                    if append_constituent_embeddings and idx == g_sent_idx:
+                        continue
+                    prompt_embeds[0, idx] = rw_embs[idx].mean(dim=0)
+        #####################
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
@@ -588,17 +607,23 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
 
+            #####################
+            # adapt the dependency matrix when using classifier-free guidance
             if use_focused_attention:
-                uncond_focused_attention_mask = torch.zeros_like(focused_attention_mask)
-                uncond_w_mask = torch.zeros_like(w_mask)
-                focused_attention_mask = torch.cat([uncond_focused_attention_mask, focused_attention_mask])
-                w_mask = torch.cat([uncond_w_mask, w_mask])
-                return prompt_embeds, negative_prompt_embeds, focused_attention_mask, w_mask
+                uncond_dependency_matrix = torch.zeros_like(dependency_matrix)
+                uncond_attribute_mask = torch.zeros_like(attribute_mask)
+                dependency_matrix = torch.cat([uncond_dependency_matrix, dependency_matrix])
+                attribute_mask = torch.cat([uncond_attribute_mask, attribute_mask])
+                return prompt_embeds, negative_prompt_embeds, dependency_matrix, attribute_mask
+            #####################
 
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
+        #####################
+        # return code when not using classifier-free guidance, not used in any experiments
         if use_focused_attention:
-            return prompt_embeds, focused_attention_mask, w_mask
+            return prompt_embeds, dependency_matrix, attribute_mask
+        #####################
 
         return prompt_embeds
 

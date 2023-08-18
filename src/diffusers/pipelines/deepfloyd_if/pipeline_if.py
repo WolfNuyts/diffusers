@@ -242,6 +242,8 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
 
+    #####################
+    # function used to find which tokens in the lal representation correspond to which tokens from the T5 representation
     def get_lal_to_if_idx_projection(self, lal_tokens, if_tokens):
         result = {}
         lal_idx = 0
@@ -261,6 +263,7 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
                 lal_idx += 1
 
         return result
+    #####################
 
     @torch.no_grad()
     def encode_prompt(
@@ -365,23 +368,26 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
+        #####################
+        # calculate the dependency matrix
         if use_focused_attention:
             if_tokens = self.tokenizer.convert_ids_to_tokens(untruncated_ids[0], skip_special_tokens=False)
             token_proj = self.get_lal_to_if_idx_projection(lal_tokens, if_tokens)
 
-            focused_attention_mask = torch.zeros(
+            dependency_matrix = torch.zeros(
                 (1, max_length, max_length)).to(device)
-            w_mask = torch.zeros((1, max_length)).to(device)
+            attribute_mask = torch.zeros((1, max_length)).to(device)
 
             for f_dep in lal_dependencies:
                 # x is dependant on y:
-                focused_attention_mask[0, token_proj[f_dep[0]], token_proj[f_dep[1]]] = 1
-                w_mask[0, token_proj[f_dep[0]]] = 1
+                dependency_matrix[0, token_proj[f_dep[0]], token_proj[f_dep[1]]] = 1
+                attribute_mask[0, token_proj[f_dep[0]]] = 1
 
-            focused_attention_mask = focused_attention_mask.type(prompt_embeds.dtype)
-            focused_attention_mask = focused_attention_mask.repeat(1, num_images_per_prompt, 1)
-            focused_attention_mask = focused_attention_mask.view(bs_embed * num_images_per_prompt, seq_len, -1)
-
+            dependency_matrix = dependency_matrix.type(prompt_embeds.dtype)
+            dependency_matrix = dependency_matrix.repeat(1, num_images_per_prompt, 1)
+            dependency_matrix = dependency_matrix.view(bs_embed * num_images_per_prompt, seq_len, -1)
+        #####################
+        
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             uncond_tokens: List[str]
@@ -426,11 +432,14 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
             negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
             negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
+            #####################
+            # adapt the dependency matrix when using classifier-free guidance
             if use_focused_attention:
-                uncond_focused_attention_mask = torch.zeros_like(focused_attention_mask)
-                uncond_w_mask = torch.zeros_like(w_mask)
-                focused_attention_mask = torch.cat([uncond_focused_attention_mask, focused_attention_mask])
-                w_mask = torch.cat([uncond_w_mask, w_mask])
+                uncond_dependency_matrix = torch.zeros_like(dependency_matrix)
+                uncond_attribute_mask = torch.zeros_like(attribute_mask)
+                dependency_matrix = torch.cat([uncond_dependency_matrix, dependency_matrix])
+                attribute_mask = torch.cat([uncond_attribute_mask, attribute_mask])
+            #####################
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
@@ -438,10 +447,13 @@ class IFPipeline(DiffusionPipeline, LoraLoaderMixin):
         else:
             negative_prompt_embeds = None
 
+        #####################
+        # return our dependency matrix
         if use_focused_attention:
-            return prompt_embeds, negative_prompt_embeds, focused_attention_mask, w_mask
+            return prompt_embeds, negative_prompt_embeds, dependency_matrix, attribute_mask
         else:
             return prompt_embeds, negative_prompt_embeds
+        #####################
 
     def run_safety_checker(self, image, device, dtype):
         if self.safety_checker is not None:
